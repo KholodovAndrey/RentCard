@@ -14,8 +14,10 @@ from reportlab.platypus import Paragraph, Frame
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from aiogram import Bot, Dispatcher, types, F
+from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from aiogram.filters import Command
 from aiogram.types import (
+    CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardMarkup,
@@ -25,6 +27,7 @@ from aiogram.types import (
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram_calendar.schemas import SimpleCalendarCallback
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -68,7 +71,8 @@ class Form(StatesGroup):
     boat = State()
     hours = State()
     date = State()
-    time = State()
+    time_hour = State()
+    time_minute = State()
     pier = State()
     guests_count = State()
     captain_name = State()
@@ -166,9 +170,9 @@ def fill_pdf_template(data: dict) -> str:
     
     # Устанавливаем шрифт и цвет текста
     try:
-        can.setFont('DejaVuSans', 10)
+        can.setFont('DejaVuSans', 12)
     except:
-        can.setFont('Helvetica', 10)
+        can.setFont('Helvetica', 12)
     
     # Устанавливаем цвет текста (RGB)
     can.setFillColor(colors.Color(1, 1, 1))  # Темно-серый цвет
@@ -228,6 +232,22 @@ def fill_pdf_template(data: dict) -> str:
     
     return output_path
 
+def generate_hours_keyboard():
+    builder = InlineKeyboardBuilder()
+    # Добавляем кнопки с часами с 9 утра до 11 вечера
+    for hour in range(9, 23):
+        builder.button(text=f"{hour}:00", callback_data=f"hour_{hour}")
+    builder.adjust(4)  # 4 кнопки в ряд
+    return builder.as_markup()
+
+def generate_minutes_keyboard(hour: int):
+    builder = InlineKeyboardBuilder()
+    # Добавляем кнопки с минутами
+    for minute in ['00', '15', '30', '45']:
+        builder.button(text=f"{hour}:{minute}", callback_data=f"minute_{hour}:{minute}")
+    builder.adjust(2)  # 2 кнопки в ряд
+    return builder.as_markup()
+
 @dp.message(Command("start"))
 async def start(message: types.Message):
     if not await is_admin(message.from_user.id):
@@ -266,32 +286,79 @@ async def process_boat(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(Form.hours)
 async def process_hours(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) not in range(1, 7):
-        await message.answer("❌ Введите число от 1 до 6:")
+        await message.answer("❌ Введите число от 1 до 6:", reply_markup=get_hours_keyboard())
         return
+    
+    # Удаляем клавиатуру выбора часов
+    await message.answer(
+        text=f"⏳ Выбрано часов аренды: {message.text}",
+        reply_markup=types.ReplyKeyboardRemove()  # Убираем reply-клавиатуру
+    )
     
     await state.update_data(hours=message.text)
     await state.set_state(Form.date)
-    await message.answer("📅 Введите дату аренды (например: 15.07.2023):", reply_markup=types.ReplyKeyboardRemove())
+    
+    # Запускаем календарь
+    await message.answer(
+        "📅 Выберите дату аренды:",
+        reply_markup=await SimpleCalendar().start_calendar()
+    )
 
 @dp.message(Form.date)
 async def process_date(message: types.Message, state: FSMContext):
-    try:
-        datetime.strptime(message.text, "%d.%m.%Y")
-        await state.update_data(date=message.text)
-        await state.set_state(Form.time)
-        await message.answer("⏰ Введите время аренды (например: 14:00):")
-    except ValueError:
-        await message.answer("❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ:")
+    await message.answer(
+        "📅 Выберите дату:",
+        reply_markup=await SimpleCalendar().start_calendar()
+    )
 
-@dp.message(Form.time)
-async def process_time(message: types.Message, state: FSMContext):
+# Добавляем новый обработчик календаря
+@dp.callback_query(SimpleCalendarCallback.filter())
+async def process_simple_calendar(
+    callback_query: CallbackQuery, 
+    callback_data: dict,
+    state: FSMContext
+):
+    selected, date = await SimpleCalendar().process_selection(callback_query, callback_data)
+    if selected:
+        await state.update_data(date=date.strftime("%d.%m.%Y"))
+        await callback_query.message.edit_text(
+            f"✅ Выбрана дата: {date.strftime('%d.%m.%Y')}"
+        )
+        await callback_query.message.answer(
+        "⏰ Выберите час начала аренды:",
+        reply_markup=generate_hours_keyboard()
+    )
+    await state.set_state(Form.time_hour)
+
+@dp.callback_query(F.data.startswith("hour_"), Form.time_hour)
+async def process_hour_selection(callback: types.CallbackQuery, state: FSMContext):
+    hour = callback.data.split("_")[1]
+    await state.update_data(time_hour=hour)
+    await callback.message.edit_text(
+        f"Выбран час: {hour}:00\n"
+        "Теперь выберите минуты:",
+        reply_markup=generate_minutes_keyboard(int(hour))
+    )
+    await state.set_state(Form.time_minute)
+
+@dp.callback_query(F.data.startswith("minute_"), Form.time_minute)
+async def process_minute_selection(callback: types.CallbackQuery, state: FSMContext):
     try:
-        datetime.strptime(message.text, "%H:%M")
-        await state.update_data(time=message.text)
+        time_str = callback.data.split("_")[1]
+        
+        # Сохраняем время и переходим к следующему шагу
+        await state.update_data(time=time_str)
+        await callback.message.edit_text(f"✅ Выбрано время: {time_str}")
+        
+        # Явно устанавливаем следующее состояние
         await state.set_state(Form.pier)
-        await message.answer("📍 Введите причал посадки/высадки:")
-    except ValueError:
-        await message.answer("❌ Неверный формат времени. Введите время в формате ЧЧ:ММ:")
+        
+        # Сразу просим ввести причал
+        await callback.message.answer("📍 Введите причал посадки/высадки:")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при выборе времени: {e}")
+        await callback.answer("❌ Ошибка выбора времени", show_alert=True)
 
 @dp.message(Form.pier)
 async def process_pier(message: types.Message, state: FSMContext):
