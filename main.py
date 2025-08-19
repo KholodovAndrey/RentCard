@@ -3,6 +3,10 @@ import json
 import re
 import logging
 import asyncio
+from PyPDF2 import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from io import BytesIO
 from datetime import datetime
 from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import A4
@@ -68,17 +72,16 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 class Form(StatesGroup):
-    boat = State()
-    hours = State()
-    date = State()
-    time_hour = State()
-    time_minute = State()
-    pier = State()
-    guests_count = State()
-    captain_name = State()
-    captain_phone = State()
-    client_name = State()
-    remaining_payment = State()
+    boat = State()         # Выбор лодки (автоматически заполняет pier, captain_name, captain_phone)
+    hours = State()        # Часы аренды
+    date = State()         # Дата
+    time_hour = State()    # Час отправления
+    time_minute = State()  # Минуты
+    time = State()         # Ручной ввод времени
+    guests_count = State() # Количество гостей (переходим сразу после времени)
+    captain_choice = State()
+    client_name = State()  # Имя клиента
+    remaining_payment = State()  # Остаток оплаты
 
 RULES = [
     "• Напитки и закуски — на ваше усмотрение, на борту есть изящные бокалы.",
@@ -99,7 +102,10 @@ async def is_admin(user_id: int) -> bool:
 
 def get_boat_select_button(boat_name: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text=f"✅ Выбрать {boat_name}", callback_data=f"boat_{boat_name}")
+    builder.button(
+        text=f"✅ Выбрать {boat_name}", 
+        callback_data=f"boat_{boat_name}"
+    )
     return builder.as_markup()
 
 def get_hours_keyboard() -> ReplyKeyboardMarkup:
@@ -151,36 +157,31 @@ def add_image_to_pdf(canvas, image_path, x, y, width, height, radius=15):
         canvas.drawImage(img, x, y, width=width, height=height)
 
 def fill_pdf_template(data: dict) -> str:
-    """Заполняет шаблон PDF (form.pdf) данными из data и возвращает путь к заполненному файлу"""
-    from PyPDF2 import PdfReader, PdfWriter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib import colors
-    from io import BytesIO
+    """Заполняет шаблон PDF данными из аренды"""
+    boat_data = BOATS[data['boat']]
     
-    # Загружаем шаблон
+    # Пути к файлам
     template_path = os.path.join(CONFIGS_DIR, 'form.pdf')
+    boat_image_path = os.path.join(PHOTOS_DIR, boat_data['photo'])
     output_path = os.path.join(BASE_DIR, 'аренда.pdf')
     
-    # Получаем путь к изображению катера
-    boat_image_path = os.path.join(PHOTOS_DIR, BOATS[data['boat']])
-    
-    # Создаем временный PDF для заполнения данных
+    # Создаем временный PDF
     packet = BytesIO()
     can = canvas.Canvas(packet, pagesize=A4)
     
-    # Устанавливаем шрифт и цвет текста
+    # Устанавливаем белый цвет текста
+    can.setFillColor(colors.white)
+    
+    # Устанавливаем шрифт
     try:
         can.setFont('DejaVuSans', 12)
     except:
         can.setFont('Helvetica', 12)
     
-    # Устанавливаем цвет текста (RGB)
-    can.setFillColor(colors.Color(1, 1, 1))  # Темно-серый цвет
-    
-    # Добавляем изображение катера (координаты и размер можно настроить)
+    # Добавляем изображение лодки
     add_image_to_pdf(can, boat_image_path, x=19, y=460, width=558, height=372, radius=30)
     
-    # Заполняем данные в шаблоне (без названий полей)
+    # Подготавливаем данные для заполнения
     fields = {
         'Дата и время': f"{data['date']} в {data['time']}",
         'Название катера': data['boat'],
@@ -193,7 +194,7 @@ def fill_pdf_template(data: dict) -> str:
         'Причал': data['pier']
     }
     
-    # Координаты (x, y) для каждого поля
+    # Координаты полей (x, y)
     coordinates = {
         'Дата и время': (22, 370),
         'Название катера': (22, 315),
@@ -206,22 +207,19 @@ def fill_pdf_template(data: dict) -> str:
         'Причал': (208, 370)
     }
     
+    # Заполняем текстовые поля
     for field, value in fields.items():
         if field in coordinates:
             x, y = coordinates[field]
             can.drawString(x, y, value)
     
     can.save()
-    
-    # Перемещаем указатель в начало
     packet.seek(0)
     new_pdf = PdfReader(packet)
     
-    # Читаем существующий PDF
+    # Объединяем с шаблоном
     existing_pdf = PdfReader(open(template_path, "rb"))
     output = PdfWriter()
-    
-    # Добавляем заполненные данные на первую страницу
     page = existing_pdf.pages[0]
     page.merge_page(new_pdf.pages[0])
     output.add_page(page)
@@ -248,17 +246,44 @@ def generate_minutes_keyboard(hour: int):
     builder.adjust(2)  # 2 кнопки в ряд
     return builder.as_markup()
 
+# Вспомогательные функции должны быть определены ДО их использования
+async def ask_hours(message: types.Message, state: FSMContext):
+    """Запрос количества часов аренды"""
+    await message.answer("Сколько часов аренды?", reply_markup=get_hours_keyboard())
+    await state.set_state(Form.hours)
+
+async def ask_captain_choice(message: types.Message, captains: list):
+    """Запрос выбора капитана"""
+    builder = InlineKeyboardBuilder()
+    for idx, captain in enumerate(captains):
+        builder.button(
+            text=f"{captain['name']} ({captain['phone']})",
+            callback_data=f"capt_{idx}"
+        )
+    builder.adjust(1)
+    await message.answer("👨‍✈️ Выберите капитана:", reply_markup=builder.as_markup())
+    
 @dp.message(Command("start"))
 async def start(message: types.Message):
     if not await is_admin(message.from_user.id):
         await message.answer("⛔ Доступ запрещён")
         return
     
-    for boat_name, photo_name in BOATS.items():
+    for boat_name, boat_data in BOATS.items():
         try:
+            photo_path = os.path.join(PHOTOS_DIR, boat_data['photo'])
+            caption = f"🚤 {boat_name}\n📍 Причал: {boat_data['pier']}"
+            
+            # Добавляем первого капитана в описание
+            if boat_data['captain']:
+                captain = boat_data['captain'][0]
+                caption += f"\n👨‍✈️ Капитан: {captain['name']} ({captain['phone']})"
+                if len(boat_data['captain']) > 1:
+                    caption += "\n(Есть выбор капитанов)"
+            
             await message.answer_photo(
-                FSInputFile(os.path.join(PHOTOS_DIR, photo_name)),
-                caption=f"🚤 {boat_name}",
+                FSInputFile(photo_path),
+                caption=caption,
                 reply_markup=get_boat_select_button(boat_name)
             )
         except Exception as e:
@@ -275,12 +300,47 @@ async def new_card(message: types.Message):
 @dp.callback_query(F.data.startswith("boat_"))
 async def process_boat(callback: types.CallbackQuery, state: FSMContext):
     boat_name = callback.data.removeprefix("boat_")
-    await state.update_data(boat=boat_name)
-    await state.set_state(Form.hours)
-    await callback.message.answer(
-        f"Вы выбрали: {boat_name}\n\nСколько часов аренды?",
-        reply_markup=get_hours_keyboard()
+    boat_data = BOATS[boat_name]
+    
+    # Сохраняем основные данные
+    await state.update_data(
+        boat=boat_name,
+        pier=boat_data['pier']
     )
+    
+    # Обработка капитанов
+    captains = boat_data['captain']  # Всегда список
+    
+    if len(captains) > 1:  # Если несколько капитанов
+        await state.set_state(Form.captain_choice)
+        await ask_captain_choice(callback.message, captains)
+    else:  # Если один капитан
+        captain = captains[0]
+        await state.update_data(
+            captain_name=captain['name'],
+            captain_phone=captain['phone']
+        )
+        await ask_hours(callback.message, state)  # Передаем state
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("capt_"), Form.captain_choice)
+async def process_captain_choice(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    boat_data = BOATS[data['boat']]
+    capt_idx = int(callback.data.removeprefix("capt_"))
+    
+    captain = boat_data['captain'][capt_idx]
+    await state.update_data(
+        captain_name=captain['name'],
+        captain_phone=captain['phone']
+    )
+    
+    await callback.message.edit_text(
+        f"✅ Выбран капитан: {captain['name']}\n"
+        f"📞 Телефон: {captain['phone']}"
+    )
+    await ask_hours(callback.message, state)  # Передаем state
     await callback.answer()
 
 @dp.message(Form.hours)
@@ -345,26 +405,25 @@ async def process_hour_selection(callback: types.CallbackQuery, state: FSMContex
 async def process_minute_selection(callback: types.CallbackQuery, state: FSMContext):
     try:
         time_str = callback.data.split("_")[1]
-        
-        # Сохраняем время и переходим к следующему шагу
         await state.update_data(time=time_str)
-        await callback.message.edit_text(f"✅ Выбрано время: {time_str}")
         
-        # Явно устанавливаем следующее состояние
-        await state.set_state(Form.pier)
+        # Получаем данные из состояния
+        data = await state.get_data()
+        boat_name = data['boat']
+        boat_data = BOATS[boat_name]
         
-        # Сразу просим ввести причал
-        await callback.message.answer("📍 Введите причал посадки/высадки:")
+        # Показываем подтверждение с автоматическими данными
+        await callback.message.edit_text(
+            "👥 Введите количество гостей:"
+        )
+        
+        # Переходим сразу к количеству гостей
+        await state.set_state(Form.guests_count)
         
     except Exception as e:
         logger.error(f"Ошибка при выборе времени: {e}")
         await callback.answer("❌ Ошибка выбора времени", show_alert=True)
 
-@dp.message(Form.pier)
-async def process_pier(message: types.Message, state: FSMContext):
-    await state.update_data(pier=message.text)
-    await state.set_state(Form.guests_count)
-    await message.answer("👥 Введите количество гостей:")
 
 @dp.message(Form.guests_count)
 async def process_guests_count(message: types.Message, state: FSMContext):
@@ -373,24 +432,18 @@ async def process_guests_count(message: types.Message, state: FSMContext):
         return
     
     await state.update_data(guests_count=message.text)
-    await state.set_state(Form.captain_name)
-    await message.answer("👨‍✈️ Введите имя капитана:")
-
-@dp.message(Form.captain_name)
-async def process_captain_name(message: types.Message, state: FSMContext):
-    await state.update_data(captain_name=message.text)
-    await state.set_state(Form.captain_phone)
-    await message.answer("📞 Введите номер телефона капитана:")
-
-@dp.message(Form.captain_phone)
-async def process_captain_phone(message: types.Message, state: FSMContext):
-    if not re.match(r'^(\+7|8)[\d\- ]{10,}$', message.text):
-        await message.answer("❌ Введите корректный номер телефона (например: +79211234567 или 89211234567):")
-        return
     
-    await state.update_data(captain_phone=message.text)
+    # Получаем данные о лодке из состояния
+    data = await state.get_data()
+    boat_data = BOATS[data['boat']]
+    
+    # Показываем подтверждение данных капитана
+    await message.answer(
+        "🙋‍♂️ Введите имя гостя:"
+    )
+    
+    # Переходим сразу к имени клиента
     await state.set_state(Form.client_name)
-    await message.answer("🙋‍♂️ Введите имя гостя:")
 
 @dp.message(Form.client_name)
 async def process_client_name(message: types.Message, state: FSMContext):
@@ -404,32 +457,41 @@ async def process_client_name(message: types.Message, state: FSMContext):
 
 @dp.message(Form.remaining_payment)
 async def process_remaining_payment(message: types.Message, state: FSMContext):
-    # Проверяем, что введено число
     if not re.match(r'^\d+$', message.text):
         await message.answer("❌ Введите сумму цифрами (например: 5000):")
         return
     
-    await state.update_data(remaining_payment=message.text)
     data = await state.get_data()
     
-    # Устанавливаем фиксированное значение для предоплаты
-    data['prepayment'] = "Предоплата внесена"
+    # Добавляем подтверждение данных
+    confirmation_text = (
+        "✅ Данные аренды:\n"
+        f"🚤 Лодка: {data['boat']}\n"
+        f"📍 Причал: {data['pier']}\n"
+        f"👨‍✈️ Капитан: {data['captain_name']} ({data['captain_phone']})\n"
+        f"📅 Дата: {data['date']} в {data['time']}\n"
+        f"⏳ Продолжительность: {data['hours']} ч.\n"
+        f"👥 Гости: {data['guests_count']}\n"
+        f"👤 Клиент: {data['client_name']}\n"
+        f"💰 Остаток к оплате: {message.text} руб."
+    )
     
-    # Заполняем шаблон PDF
+    await message.answer(confirmation_text)
+    
+    # Генерация PDF
+    data['remaining_payment'] = message.text
     pdf_path = fill_pdf_template(data)
     
-    # Отправляем заполненный PDF
     with open(pdf_path, 'rb') as pdf_file:
         await message.answer_document(
             types.BufferedInputFile(pdf_file.read(), filename="аренда.pdf"),
-            caption="✅ Ваша карточка аренды готова!"
+            caption="📄 Ваша карточка аренды готова!"
         )
     
-    # Удаляем временный файл
     os.remove(pdf_path)
     await state.clear()
     
-    # Показываем кнопку "Новая карточка" после отправки
+    # Предлагаем создать новую карточку
     await message.answer(
         "Создать новую карточку:",
         reply_markup=ReplyKeyboardMarkup(
