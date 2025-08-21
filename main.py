@@ -98,7 +98,7 @@ MANAGER_INFO = [
 ]
 
 async def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+    return True #user_id == ADMIN_ID
 
 def get_boat_select_button(boat_name: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -106,13 +106,19 @@ def get_boat_select_button(boat_name: str) -> InlineKeyboardMarkup:
         text=f"✅ Выбрать {boat_name}", 
         callback_data=f"boat_{boat_name}"
     )
+    builder.button(
+        text="⬅️ Назад", 
+        callback_data="back_to_boats"
+    )
+    builder.adjust(1)  # Располагаем кнопки вертикально
     return builder.as_markup()
 
 def get_hours_keyboard() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
-    for i in range(1, 7):
-        builder.add(KeyboardButton(text=str(i)))
-    builder.adjust(3, 3)
+    hours = ['1', '1.5', '2', '2.5', '3', '4', '5', '6']
+    for hour in hours:
+        builder.add(KeyboardButton(text=hour))
+    builder.adjust(4, 4)  # 4 кнопки в первом ряду, 4 во втором
     return builder.as_markup(resize_keyboard=True)
 
 def round_corners(image_path, radius=20):
@@ -269,29 +275,143 @@ async def start(message: types.Message):
         await message.answer("⛔ Доступ запрещён")
         return
     
-    for boat_name, boat_data in BOATS.items():
-        try:
-            photo_path = os.path.join(PHOTOS_DIR, boat_data['photo'])
-            caption = f"🚤 {boat_name}\n📍 Причал: {boat_data['pier']}"
-            
-            # Добавляем первого капитана в описание
-            if boat_data['captain']:
-                captain = boat_data['captain'][0]
-                caption += f"\n👨‍✈️ Капитан: {captain['name']} ({captain['phone']})"
-                if len(boat_data['captain']) > 1:
-                    caption += "\n(Есть выбор капитанов)"
-            
-            await message.answer_photo(
-                FSInputFile(photo_path),
-                caption=caption,
-                reply_markup=get_boat_select_button(boat_name)
-            )
-        except Exception as e:
-            logger.error(f"Ошибка загрузки фото {boat_name}: {e}")
-            await message.answer(
-                f"🚤 {boat_name}",
-                reply_markup=get_boat_select_button(boat_name)
-            )
+    # Создаем инлайн клавиатуру с кнопками лодок
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    # Сортируем названия лодок по алфавиту
+    sorted_boat_names = sorted(BOATS.keys())
+    
+    # Создаем кнопки в 3 столбца
+    buttons = []
+    for i in range(0, len(sorted_boat_names), 3):  # Меняем шаг на 3
+        row = []
+        
+        # Добавляем до 3 кнопок в строку
+        for j in range(3):
+            if i + j < len(sorted_boat_names):
+                boat_name = sorted_boat_names[i + j]
+                row.append(InlineKeyboardButton(
+                    text=boat_name,
+                    callback_data=f"boat_select:{boat_name}"
+                ))
+        
+        buttons.append(row)
+    
+    keyboard.inline_keyboard = buttons
+    
+    await message.answer(
+        "🚤 Выберите катер:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "cancel_boat_selection", Form.captain_choice)
+async def cancel_captain_selection(callback: types.CallbackQuery, state: FSMContext):
+    # Очищаем состояние
+    await state.clear()
+    
+    # Создаем инлайн клавиатуру с кнопками лодок
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    # Сортируем названия лодок по алфавиту
+    sorted_boat_names = sorted(BOATS.keys())
+    
+    # Создаем кнопки в 3 столбца
+    buttons = []
+    for i in range(0, len(sorted_boat_names), 3):
+        row = []
+        
+        # Добавляем до 3 кнопок в строку
+        for j in range(3):
+            if i + j < len(sorted_boat_names):
+                boat_name = sorted_boat_names[i + j]
+                row.append(InlineKeyboardButton(
+                    text=boat_name,
+                    callback_data=f"boat_select:{boat_name}"
+                ))
+        
+        buttons.append(row)
+    
+    keyboard.inline_keyboard = buttons
+    
+    # Редактируем сообщение с возвратом к выбору катера
+    await callback.message.edit_text(
+        "🚤 Выберите катер:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_boats")
+async def back_to_boats_list(callback: types.CallbackQuery, state: FSMContext):
+    # Очищаем состояние
+    await state.clear()
+    
+    # Создаем инлайн клавиатуру с кнопками лодок
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    # Сортируем названия лодок по алфавиту
+    sorted_boat_names = sorted(BOATS.keys())
+    
+    # Создаем кнопки в 3 столбца
+    buttons = []
+    for i in range(0, len(sorted_boat_names), 3):
+        row = []
+        
+        # Добавляем до 3 кнопок в строку
+        for j in range(3):
+            if i + j < len(sorted_boat_names):
+                boat_name = sorted_boat_names[i + j]
+                row.append(InlineKeyboardButton(
+                    text=boat_name,
+                    callback_data=f"boat_select:{boat_name}"
+                ))
+        
+        buttons.append(row)
+    
+    keyboard.inline_keyboard = buttons
+    
+    # Отправляем новое сообщение со списком катеров
+    await callback.message.answer(
+        "🚤 Выберите катер:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+# Обработчик выбора лодки
+@dp.callback_query(lambda c: c.data.startswith("boat_select:"))
+async def process_boat_selection(callback_query: types.CallbackQuery):
+    boat_name = callback_query.data.split(":")[1]
+    
+    if boat_name not in BOATS:
+        await callback_query.answer("Катер не найден")
+        return
+    
+    boat_data = BOATS[boat_name]
+    
+    try:
+        photo_path = os.path.join(PHOTOS_DIR, boat_data['photo'])
+        caption = f"🚤 {boat_name}\n📍 Причал: {boat_data['pier']}"
+        
+        # Добавляем первого капитана в описание
+        if boat_data['captain']:
+            captain = boat_data['captain'][0]
+            caption += f"\n👨‍✈️ Капитан: {captain['name']} ({captain['phone']})"
+            if len(boat_data['captain']) > 1:
+                caption += "\n(Есть выбор капитанов)"
+        
+        await callback_query.message.answer_photo(
+            FSInputFile(photo_path),
+            caption=caption,
+            reply_markup=get_boat_select_button(boat_name)
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка загрузки фото {boat_name}: {e}")
+        await callback_query.message.answer(
+            f"🚤 {boat_name}\n📍 Причал: {boat_data['pier']}",
+            reply_markup=get_boat_select_button(boat_name)
+        )
+    
+    await callback_query.answer()
 
 @dp.message(F.text == "Новая карточка")
 async def new_card(message: types.Message):
@@ -343,10 +463,51 @@ async def process_captain_choice(callback: types.CallbackQuery, state: FSMContex
     await ask_hours(callback.message, state)  # Передаем state
     await callback.answer()
 
+@dp.callback_query(F.data == "cancel_boat_selection")
+async def cancel_boat_selection(callback: types.CallbackQuery, state: FSMContext):
+    # Очищаем состояние
+    await state.clear()
+    
+    # Создаем инлайн клавиатуру с кнопками лодок
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    # Сортируем названия лодок по алфавиту
+    sorted_boat_names = sorted(BOATS.keys())
+    
+    # Создаем кнопки в 3 столбца
+    buttons = []
+    for i in range(0, len(sorted_boat_names), 3):
+        row = []
+        
+        # Добавляем до 3 кнопок в строку
+        for j in range(3):
+            if i + j < len(sorted_boat_names):
+                boat_name = sorted_boat_names[i + j]
+                row.append(InlineKeyboardButton(
+                    text=boat_name,
+                    callback_data=f"boat_select:{boat_name}"
+                ))
+        
+        buttons.append(row)
+    
+    keyboard.inline_keyboard = buttons
+    
+    # Редактируем сообщение с возвратом к выбору катера
+    await callback.message.edit_text(
+        "🚤 Выберите катер:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
 @dp.message(Form.hours)
 async def process_hours(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) not in range(1, 7):
-        await message.answer("❌ Введите число от 1 до 6:", reply_markup=get_hours_keyboard())
+    allowed_hours = ['1', '1.5', '2', '2.5', '3', '4', '5', '6']
+    
+    if message.text not in allowed_hours:
+        await message.answer(
+            "❌ Выберите значение из предложенных:",
+            reply_markup=get_hours_keyboard()
+        )
         return
     
     # Удаляем клавиатуру выбора часов
