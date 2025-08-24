@@ -80,6 +80,8 @@ class Form(StatesGroup):
     time = State()         # Ручной ввод времени
     guests_count = State() # Количество гостей (переходим сразу после времени)
     captain_choice = State()
+    custom_captain = State()      # Новое состояние для ручного ввода
+    custom_captain_phone = State() # Новое состояние для телефона
     client_name = State()  # Имя клиента
     remaining_payment = State()  # Остаток оплаты
 
@@ -239,8 +241,8 @@ def fill_pdf_template(data: dict) -> str:
 def generate_hours_keyboard():
     builder = InlineKeyboardBuilder()
     # Добавляем кнопки с часами с 9 утра до 11 вечера
-    for hour in range(9, 23):
-        builder.button(text=f"{hour}:00", callback_data=f"hour_{hour}")
+    for hour in range(0, 24):
+        builder.button(text=f"{hour}", callback_data=f"hour_{hour}")
     builder.adjust(4)  # 4 кнопки в ряд
     return builder.as_markup()
 
@@ -259,15 +261,52 @@ async def ask_hours(message: types.Message, state: FSMContext):
     await state.set_state(Form.hours)
 
 async def ask_captain_choice(message: types.Message, captains: list):
-    """Запрос выбора капитана"""
+    """Запрос выбора капитана с опцией ручного ввода"""
     builder = InlineKeyboardBuilder()
     for idx, captain in enumerate(captains):
         builder.button(
             text=f"{captain['name']} ({captain['phone']})",
             callback_data=f"capt_{idx}"
         )
+    # Добавляем кнопку ручного ввода
+    builder.button(
+        text="👨‍✈️ Ввести другого капитана",
+        callback_data="custom_captain"
+    )
+    # Добавим в ask_captain_choice кнопку отмены
+    builder.button(
+        text="❌ Отмена",
+        callback_data="cancel_boat_selection"
+    )
     builder.adjust(1)
     await message.answer("👨‍✈️ Выберите капитана:", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data == "custom_captain", Form.captain_choice)
+async def start_custom_captain_input(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("👨‍✈️ Введите ФИО капитана:")
+    await state.set_state(Form.custom_captain)
+    await callback.answer()
+
+@dp.message(Form.custom_captain)
+async def process_custom_captain_name(message: types.Message, state: FSMContext):
+    if not re.match(r'^[A-Za-zА-Яа-я\s-]+$', message.text):
+        await message.answer("❌ Имя может содержать только буквы, пробелы и дефисы. Введите снова:")
+        return
+    
+    await state.update_data(captain_name=message.text)
+    await message.answer("📞 Введите телефон капитана:")
+    await state.set_state(Form.custom_captain_phone)
+
+@dp.message(Form.custom_captain_phone)
+async def process_custom_captain_phone(message: types.Message, state: FSMContext):
+    # Простая валидация телефона
+    if not re.match(r'^[\d\s\(\)\-\+]+$', message.text):
+        await message.answer("❌ Введите корректный номер телефона:")
+        return
+    
+    await state.update_data(captain_phone=message.text)
+    await ask_hours(message, state)
     
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -429,19 +468,9 @@ async def process_boat(callback: types.CallbackQuery, state: FSMContext):
     )
     
     # Обработка капитанов
-    captains = boat_data['captain']  # Всегда список
-    
-    if len(captains) > 1:  # Если несколько капитанов
-        await state.set_state(Form.captain_choice)
-        await ask_captain_choice(callback.message, captains)
-    else:  # Если один капитан
-        captain = captains[0]
-        await state.update_data(
-            captain_name=captain['name'],
-            captain_phone=captain['phone']
-        )
-        await ask_hours(callback.message, state)  # Передаем state
-    
+    captains = boat_data['captain']
+    await state.set_state(Form.captain_choice)
+    await ask_captain_choice(callback.message, captains)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("capt_"), Form.captain_choice)
@@ -460,7 +489,7 @@ async def process_captain_choice(callback: types.CallbackQuery, state: FSMContex
         f"✅ Выбран капитан: {captain['name']}\n"
         f"📞 Телефон: {captain['phone']}"
     )
-    await ask_hours(callback.message, state)  # Передаем state
+    await ask_hours(callback.message, state)
     await callback.answer()
 
 @dp.callback_query(F.data == "cancel_boat_selection")
